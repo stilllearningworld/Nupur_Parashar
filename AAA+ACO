@@ -1,0 +1,580 @@
+#THIS IS UPDATED CODE MOST LATELY
+import numpy as np
+import random
+from joblib import Parallel, delayed
+import matplotlib.pyplot as plt
+
+class AAAClustering:
+    def __init__(self, data, energies, num_clusters, population_size=15, max_iterations=15, 
+                 shear_force=2.2, adaptation_param=0.5, K_s=1.0, p_exp=1.0, beta_energy=1.0, max_energy=0.5):
+        self.data = data
+        self.energies = energies
+        self.num_clusters = num_clusters
+        self.population_size = population_size
+        self.max_iterations = max_iterations
+        self.shear_force = shear_force
+        self.adaptation_param = adaptation_param
+        self.K_s = K_s
+        self.p = p_exp
+        self.beta_energy = beta_energy
+        self.max_energy = max_energy
+        self.dim = data.shape[1]
+        self.population = self.initialize_population()
+        self.colony_sizes = np.ones(population_size)
+        self.best_solution = None
+        self.best_fitness = np.inf
+        self.starving = 0.0
+        self.fitness_history = []
+
+    def initialize_population(self):
+        data_min, data_max = np.min(self.data, axis=0), np.max(self.data, axis=0)
+        return [np.random.uniform(data_min, data_max, (self.num_clusters, self.dim)) for _ in range(self.population_size)]
+
+    def assign_clusters(self, centers):
+        distances = np.linalg.norm(self.data[:, np.newaxis, :] - centers[np.newaxis, :, :], axis=2)
+        return np.argmin(distances, axis=1)
+
+    def compute_fitness(self, centers):
+        assignments = self.assign_clusters(centers)
+        fitness = 0.0
+        for k in range(self.num_clusters):
+            cluster_points = self.data[assignments == k]
+            if cluster_points.shape[0] > 0:
+                fitness += np.sum(np.linalg.norm(cluster_points - centers[k], axis=1)**2)
+            distances = np.linalg.norm(self.data - centers[k], axis=1)
+            min_index = np.argmin(distances)
+            energy_near = self.energies[min_index]
+            penalty = self.beta_energy * ((self.max_energy - energy_near) / self.max_energy)
+            fitness += penalty
+        return fitness
+
+    def helical_update(self, candidate, best_candidate, colony_size):
+        tau = (3.0 / 2.0) * colony_size
+        step_factor = (self.shear_force - tau) ** self.p
+        new_candidate = np.copy(candidate)
+        for i in range(self.num_clusters):
+            if self.dim == 2:
+                alpha = random.uniform(0, 2 * np.pi)
+                direction = np.array([np.cos(alpha), np.sin(alpha)])
+            else:
+                direction = np.random.randn(self.dim)
+                direction /= np.linalg.norm(direction)
+            diff = best_candidate[i] - candidate[i]
+            new_candidate[i] = candidate[i] + diff * step_factor + direction * random.uniform(0, 1) * step_factor
+        return np.clip(new_candidate, np.min(self.data, axis=0), np.max(self.data, axis=0))
+
+    def evolutionary_update(self, fitness, colony_size):
+        S = 1.0 / max(fitness, 1e-6)  # Avoid division by zero
+        mu = S / (self.K_s + S)
+        return mu * colony_size
+
+    def optimize(self):
+        for it in range(self.max_iterations):
+            self.shear_force *= (0.99 + 0.01 * np.random.rand())  # Adaptive adjustment
+            self.p = 1.0 + np.sin(it / self.max_iterations * np.pi)  # Cyclic variation
+            self.beta_energy *= 1.01  # Increase penalty effect over iterations
+
+            fitness_values = Parallel(n_jobs=-1)(delayed(self.compute_fitness)(cand) for cand in self.population)
+            
+            for idx, fitness in enumerate(fitness_values):
+                if fitness < self.best_fitness:
+                    self.best_fitness = fitness
+                    self.best_solution = self.population[idx].copy()
+                
+                self.colony_sizes[idx] = self.evolutionary_update(fitness, self.colony_sizes[idx])
+                new_candidate = self.helical_update(self.population[idx], self.best_solution, self.colony_sizes[idx])
+                new_fitness = self.compute_fitness(new_candidate)
+                
+                if new_fitness < fitness:
+                    self.population[idx] = new_candidate
+                else:
+                    mutation = np.random.standard_cauchy(size=new_candidate.shape) * 0.1  # Cauchy mutation for better exploration
+                    self.population[idx] = np.clip(new_candidate + mutation, np.min(self.data, axis=0), np.max(self.data, axis=0))
+            
+            self.fitness_history.append(self.best_fitness)
+            max_colony_size = np.max(self.colony_sizes)
+            self.starving = self.starving + (max_colony_size - self.starving) * random.random()
+        
+        return self.best_solution, self.best_fitness
+
+    def plot_fitness(self):
+        plt.plot(self.fitness_history)
+        plt.xlabel('Iteration')
+        plt.ylabel('Best Fitness Value')
+        plt.title('Fitness Value Over Iterations')
+        plt.show()
+
+import numpy as np
+import random
+
+class ACO_Routing:
+    def __init__(self, CHs, BS, alpha=1, beta=2, rho=0.5, Q=1, num_ants=10, max_iterations=100, phi1=0.5, phi2=0.3, phi3=0.2):
+        """
+        Initializes the ACO routing algorithm.
+
+        Args:
+            CHs: A list of cluster head dictionaries, each with 'id', 'x', 'y', and 'E' (energy).
+            BS: A dictionary representing the base station with 'x' and 'y' coordinates.
+            alpha: Pheromone exponential weight.
+            beta: Heuristic exponential weight.
+            rho: Pheromone evaporation rate.
+            Q: Constant value for pheromone update.
+            num_ants: Number of ants.
+            max_iterations: Maximum number of iterations.
+            phi1, phi2, phi3: Weights for energy, distance, and node degree in cost calculation.
+        """
+        self.CHs = CHs
+        self.BS = BS
+        self.num_chs = len(CHs)
+        self.alpha = alpha
+        self.beta = beta
+        self.rho = rho
+        self.Q = Q
+        self.num_ants = num_ants
+        self.max_iterations = max_iterations
+        self.phi1 = phi1
+        self.phi2 = phi2
+        self.phi3 = phi3
+
+        # Initialize pheromone matrix
+        self.tau_min = 0.01  # Minimum pheromone value
+        self.tau_max = 5.0   # Maximum pheromone value
+        self.tau = np.ones((self.num_chs, self.num_chs)) * 2  # Start with moderate pheromone levels
+
+    def calculate_distance(self, ch1, ch2):
+        """Calculates Euclidean distance between two cluster heads."""
+        return np.sqrt((ch1['x'] - ch2['x'])**2 + (ch1['y'] - ch2['y'])**2)
+
+    def calculate_heuristic(self, ch1, ch2):
+        """Calculates heuristic information (inverse of distance)."""
+        distance = self.calculate_distance(ch1, ch2)
+        return 1 / distance if distance > 0 else 0  # Avoid division by zero
+
+    def calculate_cost(self, path):
+        """Calculates the cost of a given path."""
+        total_cost = 0
+        for i in range(len(path) - 1):
+            current_ch = path[i]
+            next_ch = path[i + 1]
+            distance = self.calculate_distance(current_ch, next_ch)
+            node_degree = len(current_ch['cluster_members']) if 'cluster_members' in current_ch else 0
+            energy_factor = 1 / current_ch['E'] if current_ch['E'] > 0 else float('inf')
+            
+            total_cost += self.phi1 * energy_factor + self.phi2 * distance + self.phi3 * node_degree
+        return total_cost
+
+    def ant_selection(self, current_ch, unvisited_chs):
+        """Selects the next CH for routing based on probability distribution."""
+        probabilities = []
+        for next_ch in unvisited_chs:
+            pheromone = self.tau[current_ch['id'], next_ch['id']]
+            heuristic = self.calculate_heuristic(current_ch, next_ch)
+            probabilities.append((pheromone**self.alpha) * (heuristic**self.beta))
+
+        probabilities = np.array(probabilities)
+        if probabilities.sum() == 0:  
+            return None  # No valid next hop
+
+        probabilities /= probabilities.sum()  # Normalize
+        next_ch_index = np.random.choice(len(unvisited_chs), p=probabilities)  # Roulette wheel selection
+        return unvisited_chs[next_ch_index]
+
+    def update_pheromone(self, paths, costs):
+        """Updates pheromone trails based on all ants' paths."""
+        # Evaporate pheromone
+        self.tau *= (1 - self.rho)
+
+        # Add new pheromone deposits
+        for path, cost in zip(paths, costs):
+            for i in range(len(path) - 1):
+                ch1, ch2 = path[i], path[i + 1]
+                self.tau[ch1['id'], ch2['id']] += self.Q / cost  # Deposit pheromone
+
+        # Apply pheromone limits
+        self.tau = np.clip(self.tau, self.tau_min, self.tau_max)
+
+    def find_best_route(self, start_ch):
+        """Finds the best routing path using ACO."""
+        best_route = None
+        min_cost = float('inf')
+
+        for _ in range(self.max_iterations):  # Iterations of ACO process
+            all_paths = []
+            all_costs = []
+
+            for _ in range(self.num_ants):  # Each ant builds a path
+                path = [start_ch]
+                current_ch = start_ch
+                unvisited_chs = [ch for ch in self.CHs if ch['id'] != start_ch['id']]
+
+                while unvisited_chs:
+                    next_ch = self.ant_selection(current_ch, unvisited_chs)
+                    if next_ch is None:  # No valid next hop
+                        break
+                    path.append(next_ch)
+                    unvisited_chs.remove(next_ch)
+                    current_ch = next_ch
+                
+                # Ensure path reaches the Base Station (BS)
+                if path and path[-1]['x'] == self.BS['x'] and path[-1]['y'] == self.BS['y']:
+                    cost = self.calculate_cost(path)
+                    all_paths.append(path)
+                    all_costs.append(cost)
+
+                    if cost < min_cost:
+                        min_cost = cost
+                        best_route = path
+            
+            if all_paths:
+                self.update_pheromone(all_paths, all_costs)  # Update pheromone using all paths
+
+        return best_route, min_cost
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+import random
+import pandas as pd
+#from ArtificialAlgaeAlgorithm import AAAClustering
+#from aco import ACO_Routing
+
+
+# ===============================
+# Simulation Parameters (with some adjustments)
+# ===============================
+N = 100
+xm, ym = 100, 100
+sink = {'x': xm, 'y': ym}
+Eo = 0.5
+p = 0.1  # Initial p value (will be adaptive later)
+rounds = 3000
+
+
+# Radio Model Parameters (same as before)
+Eelec = 50e-9
+Efs = 10e-12
+Emp = 0.0013e-12
+d0 = np.sqrt(Efs / Emp)
+ETX = Eelec
+ERX = Eelec
+EDA = 5e-9
+packet_size = 4000
+
+# CH selection interval: only perform AAA-based CH selection every 10 rounds
+CH_SELECTION_INTERVAL = 20
+current_CH_indices = None  # to store CH indices from the last selection
+
+# AAA Parameters (tunable)
+AAA_POPULATION_SIZE = 20
+AAA_MAX_ITERATIONS = 25
+AAA_SHEAR_FORCE = 1.8
+AAA_BETA_ENERGY = 2.0
+
+# ACO Parameters (tunable)
+ACO_NUM_ANTS = 20
+ACO_EVAPORATION_RATE = 0.5
+# ... other ACO parameters
+
+# ===============================
+# Sensor Node Deployment (using Pandas DataFrame)
+# ===============================
+nodes_df = pd.DataFrame({
+    'x': np.random.rand(N) * xm,
+    'y': np.random.rand(N) * ym,
+    'E': Eo,
+    'G': 0,
+    'isCH': False,
+    'cluster_head': None,
+    'cluster_members': [[] for _ in range(N)],  # Initialize as empty lists
+    'id': range(N)
+})
+
+dead_nodes = 0
+Avg_energy_per_round = []
+alive_nodes_per_round = []
+throughput_per_round = []
+round_no = 0
+
+# New metrics: track first node dead and last node dead rounds
+first_node_dead_round = None
+last_node_dead_round = None
+
+# ===============================
+# Helper Functions
+# ===============================
+def calculate_energy_consumption(distances, is_d0):
+    """Calculates energy consumption using the appropriate model."""
+    return Eelec * packet_size + np.where(is_d0, Efs * packet_size * (distances**2), Emp * packet_size * (distances**4))
+
+def select_chs(nodes_df, round_no):
+    """Selects Cluster Heads using AAA."""
+    if round_no % CH_SELECTION_INTERVAL == 0:
+        alive_nodes = nodes_df[nodes_df['E'] > 0]
+        if alive_nodes.empty:
+            return None
+
+        alive_positions = alive_nodes[['x', 'y']].to_numpy()
+        alive_energies = alive_nodes['E'].to_numpy()
+        num_CHs = max(1, int(p * len(alive_nodes)))
+
+        aaa = AAAClustering(alive_positions, alive_energies, num_CHs,
+                            population_size=AAA_POPULATION_SIZE, max_iterations=AAA_MAX_ITERATIONS,
+                            shear_force=AAA_SHEAR_FORCE, beta_energy=AAA_BETA_ENERGY, max_energy=Eo)
+        best_centers, best_fit = aaa.optimize()
+
+        # ... (rest of CH selection logic - same as before)---this is done
+        chosen_CH_indices = []
+        available_indices = list(alive_nodes.index) # Use indices from the DataFrame
+        available_indices = alive_indices.copy()
+        available_positions = alive_positions.copy()
+        for center in best_centers:
+            distances = np.linalg.norm(available_positions - center, axis=1)
+            min_index = np.argmin(distances)
+            chosen_node_index = available_indices[min_index]
+            chosen_CH_indices.append(chosen_node_index)
+            available_indices.pop(min_index)
+            available_positions = np.delete(available_positions, min_index, axis=0)
+            if len(available_indices) == 0:
+                break
+        return chosen_CH_indices  # Return the newly selected CH indices
+    else:
+        # Important: Return the *current* CH indices if it's not a CH selection round
+        # If it's the first round, current_CH_indices will be None, so handle that:
+        if current_CH_indices is not None and any(nodes_df.loc[ch_index, 'E'] > 0 for ch_index in current_CH_indices): # Check if there is any CH available
+            return current_CH_indices # Return the current CH indices if it's not a CH selection round
+        else: # Handle the case where no CHs are available, for example, at the beginning
+            return None # Or some other appropriate value indicating no CHs
+          
+    return current_CH_indices # Return the current CH indices if it's not a CH selection round
+
+def form_clusters(nodes_df):
+    """Forms clusters based on distance and energy."""
+    # ... (same logic as before, but using nodes_df)--its same only
+    gamma = 2.0
+    E_forward = ETX * packet_size + ERX * packet_size + EDA * packet_size
+    for i in range(len(nodes_df)):
+        if nodes_df['E'][i] > 0 and not nodes_df['isCH'][i]:
+            best_score = float('inf')
+            best_CH = None
+            for j in range(len(nodes_df)):
+                if nodes_df['E'][j] > 0 and nodes_df['isCH'][j]:
+                    d = np.sqrt((nodes_df['x'][i] - nodes_df['x'][j])**2 + (nodes_df['y'][i] - nodes_df['y'][j])**2)
+                    degree = len(nodes_df['cluster_members'][j])
+                    score = d + gamma * (degree * E_forward) / (nodes_df['E'][j] + 1e-6)
+                    if score < best_score:
+                        best_score = score
+                        best_CH = j
+            nodes_df['cluster_head'][i] = best_CH
+            if best_CH is not None:
+                nodes_df['cluster_members'][best_CH].append(i)
+
+def dissipate_energy(nodes_df):
+    """Dissipates energy for all nodes."""
+    # Vectorized energy dissipation for non-CH nodes
+    non_ch_alive = nodes_df[(nodes_df['E'] > 0) & (~nodes_df['isCH'])]
+    if not non_ch_alive.empty:
+        # Vectorized energy dissipation for non-CH nodes with cluster heads
+        non_ch_with_ch = non_ch_alive[non_ch_alive['cluster_head'].notna()]
+        if not non_ch_with_ch.empty:
+            ch_positions = nodes_df.loc[non_ch_with_ch['cluster_head'], ['x', 'y']].to_numpy()
+            non_ch_positions = non_ch_with_ch[['x', 'y']].to_numpy()
+            distances = np.linalg.norm(non_ch_positions - ch_positions, axis=1)
+            is_d0 = distances < d0
+            E_tx = calculate_energy_consumption(distances, is_d0)
+            nodes_df.loc[non_ch_with_ch.index, 'E'] -= E_tx
+
+        # Vectorized energy dissipation for non-CH nodes without cluster heads
+        non_ch_no_ch = non_ch_alive[non_ch_alive['cluster_head'].isna()]
+        if not non_ch_no_ch.empty:
+            sink_distances = np.linalg.norm(non_ch_no_ch[['x', 'y']].to_numpy() - np.array([sink['x'], sink['y']]), axis=1)
+            is_d0 = sink_distances < d0
+            E_tx = calculate_energy_consumption(sink_distances, is_d0)
+            nodes_df.loc[non_ch_no_ch.index, 'E'] -= E_tx
+
+    # Energy dissipation for CH nodes (using ACO - adapted)
+    ch_alive = nodes_df[(nodes_df['E'] > 0) & (nodes_df['isCH'])]
+    if not ch_alive.empty:
+        optimal_chs = ch_alive.to_dict('records')  # Convert to list of dictionaries
+        aco = ACO_Routing(optimal_chs, sink)  # Assuming ACO_Routing is adapted to handle dictionaries
+        # ... (rest of CH energy dissipation using ACO - same logic, but using optimal_chs)--this is done
+        optimal_CHs = []
+        for i, node in enumerate(nodes):
+            if node['E'] > 0 and node['isCH']:
+                optimal_CHs.append({'id': i, 'x': node['x'], 'y': node['y'], 'E': node['E'], 'cluster_members': node['cluster_members']})
+
+        if optimal_CHs: # Check if there is CH available
+            aco = ACO_Routing(optimal_CHs, sink)
+            start_ch = optimal_CHs[0]
+            best_route, min_cost = aco.find_best_route(start_ch)
+
+        if best_route:
+            for i in range(len(best_route)):
+                next_hop = sink if i == len(best_route) - 1 else best_route[i+1] # Simplified next hop logic
+                d = np.sqrt((next_hop['x'] - best_route[i]['x'])**2 + (next_hop['y'] - best_route[i]['y'])**2)
+
+                num_members = len(best_route[i]['cluster_members']) + 1
+                E_tx_CH = Eelec * num_members * packet_size + (Efs if d < d0 else Emp) * num_members * packet_size * (d**2 if d < d0 else d**4) + 2 * EDA * num_members * packet_size
+                best_route[i]['E'] -= E_tx_CH
+
+# ===============================
+# Simulation Loop
+# ===============================
+while dead_nodes < N and round_no < rounds:
+    round_no += 1
+
+    nodes_df['isCH'] = False
+    nodes_df['cluster_head'] = None
+    nodes_df['cluster_members'] = [[] for _ in range(N)]  # Reset cluster members
+
+    current_CH_indices = select_chs(nodes_df, round_no)
+    if current_CH_indices is None: # No CH available
+        break
+    if current_CH_indices is not None:
+        nodes_df.loc[current_CH_indices, 'isCH'] = True
+
+    form_clusters(nodes_df)
+    dissipate_energy(nodes_df)
+ 
+            
+
+    # ----- Update Metrics -----
+    dead_nodes = sum(1 for node in nodes if node['E'] <= 0)
+    Average_energy_consumption = sum(max(node['E'], 0) for node in nodes) / N
+    alive_nodes = sum(1 for node in nodes if node['E'] > 0)
+    throughput = packet_size * sum(1 for node in nodes if node['E'] > 0 and node['isCH'])
+    
+    Avg_energy_per_round.append(Average_energy_consumption)
+    alive_nodes_per_round.append(alive_nodes)
+    throughput_per_round.append(throughput)
+    
+    # Track first and last node dead rounds
+    if dead_nodes > 0 and first_node_dead_round is None:
+        first_node_dead_round = round_no
+    if dead_nodes > 0:
+        last_node_dead_round = round_no
+
+    if round_no % 10 == 0:
+        print(f"Round: {round_no}, Average Energy Energy: {Avg_energy_per_round[-1]:.4f}, Alive Nodes: {alive_nodes}, "
+              f"Throughput: {throughput}, Dead Nodes: {dead_nodes}")
+    print("end of round number ")
+    print(round_no)
+    print("Avg_energy_per_round")
+    print(Avg_energy_per_round)
+    print("alive_nodes_per_round")
+    print(alive_nodes_per_round)
+    print("throughput_per_round")
+    print(throughput_per_round)
+# Before plotting, ensure first_node_dead_round and last_node_dead_round are not None
+if first_node_dead_round is None:
+    first_node_dead_round = 0  # or round_no, if you prefer
+if last_node_dead_round is None:
+    last_node_dead_round = 0  # or round_no
+print("first_node_dead_round=")
+print(first_node_dead_round)
+print("last_node_dead_round")
+print(last_node_dead_round)
+
+'''# ----- Plotting the Metrics -----
+def moving_average(data, window_size):
+    if not data:  # Check if data is empty
+        return np.array([])  # Return an empty array if data is empty
+
+    if len(data) < window_size:
+        window_size = len(data)  # Adjust window size if data is too short
+    return np.convolve(data, np.ones(window_size)/window_size, mode='valid')
+
+window_size = 10
+
+# Check if throughput_per_round is empty before calling moving_average
+if throughput_per_round:  # If the list is not empty
+    smoothed_throughput = moving_average(throughput_per_round, window_size)
+else:
+    smoothed_throughput = np.array([])  # Or handle it in another way (e.g., plot nothing)
+
+# ... (rest of your plotting code, handling the case where smoothed_throughput might be empty)
+
+fig, axs = plt.subplots(4, 1, figsize=(10, 20))
+
+# Average energy consumption Energy Plot
+
+
+x_data = range(1, round_no + 1)
+y_data = Avg_energy_per_round
+
+# Find the minimum length to avoid shape mismatch
+min_len = min(len(x_data), len(y_data))
+
+axs[0].plot(x_data[:min_len], y_data[:min_len], 'b-', linewidth=2, label="Residual Energy (J)")  # Plot only up to min_len
+
+
+axs[0].set_xlabel("Round")
+axs[0].set_ylabel("Average Energy Consumption Energy (J)")
+axs[0].set_title("Average Energy consumption Over Rounds")
+axs[0].legend()
+axs[0].grid(True)
+
+# Save the plot to a file
+plt.savefig("my_plot1.png")  # Saves as PNG
+
+# You can also specify DPI for higher resolution
+plt.savefig("high_res_plot.png", dpi=300)
+
+# Alive Nodes Plot (Network Lifetime)
+# ... (inside your plotting section)
+
+x_data = range(1, round_no + 1)
+y_data = alive_nodes_per_round
+
+min_len = min(len(x_data), len(y_data))  # Find the minimum length
+
+axs[1].plot(x_data[:min_len], y_data[:min_len], 'g-', linewidth=2, label="Alive Nodes")
+
+axs[1].set_xlabel("Round")
+axs[1].set_ylabel("Number of Alive Nodes")
+axs[1].set_title("Network Lifetime: Alive Nodes Over Rounds")
+axs[1].legend()
+axs[1].grid(True)
+
+# Save the plot to a file
+plt.savefig("my_plot2.png")  # Saves as PNG
+# You can also specify DPI for higher resolution
+plt.savefig("high_res_plot.png", dpi=300)
+
+# Throughput Plot (Raw and Smoothed)
+y_data = throughput_per_round # Use the correct y-data
+min_len = min(len(x_data), len(y_data)) # Recalculate min_len
+axs[2].plot(x_data[:min_len], y_data[:min_len], 'r-', linewidth=1, label="Raw Throughput")
+# ***KEY CHANGE HERE***: Check if smoothed_throughput has data before plotting
+if smoothed_throughput.size > 0:  # .size is better than len() for numpy arrays
+    smoothed_rounds = range(window_size, len(throughput_per_round) + 1) # Corrected range calculation
+    axs[2].plot(smoothed_rounds, smoothed_throughput, 'k-', linewidth=2, label="Smoothed Throughput")
+else:
+    print("Warning: Smoothed throughput is empty. Not plotting smoothed line.")
+
+axs[2].set_xlabel("Round")
+axs[2].set_ylabel("Throughput (bits/round)")
+axs[2].set_title("Throughput Over Rounds")
+axs[2].legend()
+axs[2].grid(True)
+# Save the plot to a file
+plt.savefig("my_plot3.png")  # Saves as PNG
+# You can also specify DPI for higher resolution
+plt.savefig("high_res_plot.png", dpi=300)
+
+# First and Last Node Dead Plot
+dead_rounds = [first_node_dead_round, last_node_dead_round]
+labels = ['First Node Dead', 'Last Node Dead']
+axs[3].bar(labels, dead_rounds, color=['red', 'blue'], width=0.4)
+axs[3].set_title("Round Numbers for First and Last Node Deaths")
+axs[3].set_ylabel("Round Number")
+axs[3].grid(True)
+# Save the plot to a file
+plt.savefig("my_plot4.png")  # Saves as PNG
+# You can also specify DPI for higher resolution
+plt.savefig("high_res_plot.png", dpi=300)
+plt.tight_layout()
+plt.show()
+
+print("Simulation complete.")
+print(f"First Node Dead Round: {first_node_dead_round}")
+print(f"Last Node Dead Round: {last_node_dead_round}")'''
